@@ -1,20 +1,13 @@
 {
-  "name": "pho-backend",
-  "version": "1.0.0",
-  "description": "Backend for Tilda ↔ Mercado Pago ↔ Google Sheets (no webhooks)",
-  "main": "server.js",
-  "type": "commonjs",
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.0"
+  },
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "axios": "^1.7.7",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "googleapis": "^144.0.0",
-    "morgan": "^1.10.0"
+    "node": "18.x"
   }
 }
