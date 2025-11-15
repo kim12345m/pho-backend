@@ -101,6 +101,46 @@ async function notifyTilda(payload) {
   }
 }
 
+// === WhatsApp: отправка уведомлений ресторану ===
+async function sendWhatsAppText(to, text) {
+  const phoneId = process.env.WA_PHONE_ID;
+  const token = process.env.WA_TOKEN;
+
+  if (!phoneId || !token) {
+    console.warn('WA_PHONE_ID или WA_TOKEN не заданы — WhatsApp-уведомление пропущено');
+    return;
+  }
+  if (!to) {
+    console.warn('WA_RESTAURANT (номер получателя) не задан — WhatsApp-уведомление пропущено');
+    return;
+  }
+
+  const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
+
+  try {
+    const resp = await axios.post(
+      url,
+      {
+        messaging_product: 'whatsapp',
+        to: to,
+        type: 'text',
+        text: { body: text }
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
+
+    console.log('WhatsApp notify:', resp.status, resp.data);
+  } catch (err) {
+    console.error('WhatsApp notify error:', err?.response?.data || err.message);
+  }
+}
+
 // ---------- app ----------
 const app = express();
 app.use(morgan('combined'));
@@ -148,7 +188,12 @@ app.post('/api/tilda/checkout', async (req, res) => {
       if (Number.isNaN(total) || total <= 0) {
         return res.status(400).send('Bad order: no items and no amount');
       }
-      items = [{ title: description || `Order ${externalRef}`, quantity: 1, currency_id: 'ARS', unit_price: total }];
+      items = [{
+        title: description || `Order ${externalRef}`,
+        quantity: 1,
+        currency_id: 'ARS',
+        unit_price: total
+      }];
     }
 
     const baseUrl = process.env.PUBLIC_BASE_URL || '';
@@ -239,6 +284,20 @@ app.post('/mp/webhook', async (req, res) => {
           items: [],
           total_amount: p.transaction_amount
         });
+
+        // === WhatsApp: уведомление ресторану при успешной оплате ===
+        if (p.status === 'approved') {
+          const to = process.env.WA_RESTAURANT; // твой номер WhatsApp (для демо) или номер ресторана
+          const msgLines = [
+            `✅ Nuevo pedido #${p.external_reference || p.id}`,
+            `Estado: PAGADO`,
+            `Total: ${p.transaction_amount} ${p.currency_id || 'ARS'}`,
+            p.payer?.email ? `Cliente: ${p.payer.email}` : ''
+          ].filter(Boolean);
+
+          await sendWhatsAppText(to, msgLines.join('\n'));
+        }
+
       } catch (e) {
         console.error('fetch payment error:', e?.response?.data || e.message);
       }
