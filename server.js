@@ -1,262 +1,320 @@
+// server.js
+// Express backend: creates MP preference, confirms payment, logs to Google Sheets.
+
 const express = require('express');
-const axios = require('axios').default;
+const cors = require('cors');
+const axios = require('axios');
+const morgan = require('morgan');
 const { google } = require('googleapis');
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ENV
+// ─────────────────────────────────────────────────────────────────────────────
+// Обязательно задайте эти переменные окружения в Render (или .env локально):
+// - MP_ACCESS_TOKEN                 (строка, Prod access token Mercado Pago)
+// - PUBLIC_BASE_URL                 (например: https://pho-backend.onrender.com)
+// - SHEETS_SPREADSHEET_ID           (ID Google-таблицы)
+// - GOOGLE_SERVICE_ACCOUNT_JSON     (полный JSON ключ сервис-аккаунта)
+// - SUCCESS_URL (опционально)       (URL страницы «Спасибо», по умолчанию: https://phorestaurante.tilda.ws/page93974626.html)
+
 const {
-  PUBLIC_BASE_URL = 'http://localhost:3000',
   MP_ACCESS_TOKEN,
-  CURRENCY = 'ARS',
+  PUBLIC_BASE_URL,
+  SHEETS_SPREADSHEET_ID,
   GOOGLE_SERVICE_ACCOUNT_JSON,
-  GOOGLE_SHEET_ID,
-  GOOGLE_SHEET_NAME = 'Pho',
-  TILDA_NOTIFICATION_URL,       // URL в Tilda, куда наш сервер отправляет уведомление
-  TILDA_SUCCESS_FIELD = 'status',
-  TILDA_SUCCESS_VALUE = 'approved',
-  TILDA_SECRET,                 // если нужно отправлять/проверять секрет
-  MP_WEBHOOK_SECRET,           // если включите подпись вебхука
+  SUCCESS_URL
 } = process.env;
 
 if (!MP_ACCESS_TOKEN) throw new Error('MP_ACCESS_TOKEN is required');
+if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL is required');
+if (!SHEETS_SPREADSHEET_ID) throw new Error('SHEETS_SPREADSHEET_ID is required');
 if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is required');
-if (!GOOGLE_SHEET_ID) throw new Error('GOOGLE_SHEET_ID is required');
 
+const TILDA_SUCCESS = SUCCESS_URL || 'https://phorestaurante.tilda.ws/page93974626.html';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// App
+// ─────────────────────────────────────────────────────────────────────────────
 const app = express();
 
-// Tilda отправляет форму как application/x-www-form-urlencoded
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+// Разрешим запросы с вашего домена Tilda и локальные тесты
+const allowedOrigins = new Set([
+  'http://phorestaurante.tilda.ws',
+  'https://phorestaurante.tilda.ws',
+  'http://tilda.ws',
+  'https://tilda.ws',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
+]);
 
-// ---------- Google Sheets helpers ----------
-const credentials = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    try {
+      const url = new URL(origin);
+      if (allowedOrigins.has(url.origin)) return cb(null, true);
+    } catch (_) {}
+    // Мягко разрешим, если хотите — ужесточите
+    return cb(null, true);
+  }
+}));
 
-function sheetsClient() {
-  const auth = new google.auth.JWT(
-    credentials.client_email,
-    null,
-    credentials.private_key,
-    ['https://www.googleapis.com/auth/spreadsheets']
-  );
-  return google.sheets({ version: 'v4', auth });
+app.use(express.json({ limit: '1mb' }));
+app.use(morgan('tiny'));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Google Sheets client
+// ─────────────────────────────────────────────────────────────────────────────
+const googleAuth = new google.auth.GoogleAuth({
+  credentials: JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON),
+  scopes: ['https://www.googleapis.com/auth/spreadsheets']
+});
+const sheetsClient = google.sheets({ version: 'v4', auth: googleAuth });
+
+const SHEET_TAB = 'Orders'; // создайте/используйте лист с таким именем
+
+async function ensureHeaderRow() {
+  // Добавим заголовки, если лист пуст
+  const get = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: SHEETS_SPREADSHEET_ID,
+    range: `${SHEET_TAB}!A1:Z1`
+  }).catch(() => null);
+
+  const values = get?.data?.values;
+  if (!values || values.length === 0) {
+    await sheetsClient.spreadsheets.values.update({
+      spreadsheetId: SHEETS_SPREADSHEET_ID,
+      range: `${SHEET_TAB}!A1:N1`,
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[
+          'timestamp_iso',
+          'order_id',
+          'mp_payment_id',
+          'status',
+          'amount',
+          'currency',
+          'buyer_name',
+          'buyer_phone',
+          'buyer_email',
+          'delivery_mode',
+          'address',
+          'note',
+          'items_json',
+          'raw_metadata_json'
+        ]]
+      }
+    });
+  }
 }
 
-async function appendOrderRow(orderRow) {
-  const sheets = sheetsClient();
-  const values = [[
-    new Date().toISOString(),
-    orderRow.order_id ?? '',
-    orderRow.payment_id ?? '',
-    orderRow.status ?? '',
-    orderRow.customer_email ?? '',
-    orderRow.customer_phone ?? '',
-    orderRow.customer_name ?? '',
-    orderRow.delivery_zone ?? '',
-    orderRow.delivery_price ?? '',
-    JSON.stringify(orderRow.items || []),
-    orderRow.total_amount ?? ''
-  ]];
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: GOOGLE_SHEET_ID,
-    range: `${GOOGLE_SHEET_NAME}!A:K`,
+async function wasPaymentLogged(paymentId) {
+  // Простой поиск дубликатов по колонке C (mp_payment_id)
+  const res = await sheetsClient.spreadsheets.values.get({
+    spreadsheetId: SHEETS_SPREADSHEET_ID,
+    range: `${SHEET_TAB}!C:C`
+  }).catch(() => null);
+  const rows = res?.data?.values || [];
+  return rows.some(r => String(r[0]) === String(paymentId));
+}
+
+async function appendOrderRow(rowArray) {
+  await ensureHeaderRow();
+  await sheetsClient.spreadsheets.values.append({
+    spreadsheetId: SHEETS_SPREADSHEET_ID,
+    range: `${SHEET_TAB}!A:Z`,
     valueInputOption: 'RAW',
-    requestBody: { values }
+    insertDataOption: 'INSERT_ROWS',
+    requestBody: { values: [rowArray] }
   });
 }
 
-async function updateRowByOrderId(order_id, patch) {
-  // Для простоты: повторно пишем строку (append) как «журнал».
-  // Если нужно именно «обновлять» существующую — добавьте поиск/scan листа.
-  await appendOrderRow({ order_id, ...patch });
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function newOrderId() {
+  // Простой внутренний orderId
+  return `pho-${Date.now()}`;
 }
 
-// ---------- Tilda items parser ----------
-function parseItemsFromTilda(body) {
-  const items = [];
-
-  // Варианты массивов: name[], quantity[], price[] или name[0], ...
-  const keys = Object.keys(body);
-
-  // name[0] вариант
-  const idxs = [...new Set(
-    keys.map(k => {
-      const m = k.match(/^name\[(\d+)\]$/);
-      return m ? Number(m[1]) : null;
-    }).filter(v => v !== null)
-  )];
-
-  if (idxs.length) {
-    idxs.sort((a,b)=>a-b).forEach(i => {
-      const title = body[`name[${i}]`];
-      const qty = Number(body[`quantity[${i}]`] ?? 1);
-      const price = Number(String(body[`price[${i}]`] ?? '0').replace(',', '.'));
-      if (title && qty > 0) {
-        items.push({ title, quantity: qty, currency_id: CURRENCY, unit_price: price });
-      }
-    });
-    return items;
-  }
-
-  // name[] как массив
-  const names = body['name[]'] || body.name;
-  const quantities = body['quantity[]'] || body.quantity;
-  const prices = body['price[]'] || body.price;
-
-  if (Array.isArray(names)) {
-    names.forEach((title, i) => {
-      const qty = Number((quantities && quantities[i]) ?? 1);
-      const price = Number(String((prices && prices[i]) ?? '0').replace(',', '.'));
-      if (title && qty > 0) {
-        items.push({ title, quantity: qty, currency_id: CURRENCY, unit_price: price });
-      }
-    });
-  } else if (names) {
-    const qty = Number(quantities ?? 1);
-    const price = Number(String(prices ?? '0').replace(',', '.'));
-    items.push({ title: names, quantity: qty, currency_id: CURRENCY, unit_price: price });
-  }
-
-  return items;
+function mapCartToMpItems(cart, currency = 'ARS') {
+  // ожидаем cart = [{ id?, title, description?, quantity, unit_price }]
+  if (!Array.isArray(cart)) return [];
+  return cart.map((p, idx) => ({
+    id: String(p.id || idx + 1),
+    title: String(p.title || 'Item'),
+    description: p.description ? String(p.description) : undefined,
+    quantity: Number(p.quantity || 1),
+    unit_price: Number(p.unit_price || 0),
+    currency_id: currency
+  }));
 }
 
-// ---------- Mercado Pago helpers ----------
-async function createPreference({ order_id, items, payer, delivery_price }) {
-  const preference = {
-    items: items.map(it => ({
-      title: it.title,
-      quantity: it.quantity,
-      unit_price: Number(it.unit_price),
-      currency_id: CURRENCY
-    })),
-    payer,                                   // { name, email, phone: { area_code, number } }
-    external_reference: String(order_id),    // чтобы связать оплату с заказом
-    back_urls: {
-      success: 'https://phorestaurante.tilda.ws/page93974626.html',
-      failure: 'https://phorestaurante.tilda.ws/page93972756.html',
-      pending: 'https://phorestaurante.tilda.ws/page93972756.html'
-    },
-    auto_return: 'approved',
-    notification_url: `${PUBLIC_BASE_URL}/mp/webhook`
-  };
+// ─────────────────────────────────────────────────────────────────────────────
+// Routes
+// ─────────────────────────────────────────────────────────────────────────────
 
-  // Если есть доставка — можно добавить как shipping cost
-  if (delivery_price) {
-    preference.shipments = { cost: Number(delivery_price), mode: 'not_specified' };
-  }
+// Health
+app.get('/health', (req, res) => res.json({ ok: true }));
 
-  const { data } = await axios.post(
-    'https://api.mercadopago.com/checkout/preferences',
-    preference,
-    { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } }
-  );
-  return data; // содержит init_point и т. д.
-}
-
-async function fetchPayment(paymentId) {
-  const { data } = await axios.get(
-    `https://api.mercadopago.com/v1/payments/${paymentId}`,
-    { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } }
-  );
-  return data;
-}
-
-// ---------- Уведомление в Tilda ----------
-async function notifyTilda({ payment_id, status }) {
-  if (!TILDA_NOTIFICATION_URL) return { sent: false, reason: 'TILDA_NOTIFICATION_URL not set' };
-
-  // Tilda ожидает form-url-encoded и plaintext ответ «OK».
-  const params = new URLSearchParams();
-  params.set('payment_id', String(payment_id));
-  params.set(TILDA_SUCCESS_FIELD, status);
-  if (TILDA_SECRET) params.set('secret', TILDA_SECRET);
-
-  const resp = await axios.post(
-    TILDA_NOTIFICATION_URL,
-    params.toString(),
-    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, validateStatus: () => true }
-  );
-
-  const ok = typeof resp.data === 'string'
-    ? resp.data.trim().toUpperCase() === 'OK'
-    : false;
-
-  return { sent: true, ok, statusCode: resp.status, body: resp.data };
-}
-
-// ---------- Endpoints ----------
-
-// 1) Tilda -> checkout (создаем preference и редиректим покупателя)
-app.post('/api/tilda/checkout', async (req, res) => {
+// 1) Создание preference
+app.post('/api/mp/create-preference', async (req, res) => {
   try {
-    const body = req.body || {};
-    const order_id = body.order_id || body.orderid || body.order || Date.now();
-    const customer = {
-      name: body.customer_name || body.name || '',
-      email: body.customer_email || body.email || '',
-      phone: body.customer_phone ? { number: String(body.customer_phone) } : undefined
-    };
-
-    const delivery_zone = body.delivery_zone || '';
-    const delivery_price = body.delivery_price ? Number(String(body.delivery_price).replace(',', '.')) : 0;
-
-    const items = parseItemsFromTilda(body);
-    const total_amount = items.reduce((s, it) => s + Number(it.unit_price) * Number(it.quantity), 0) + (delivery_price || 0);
-
-    // Журналируем заказ со статусом pending
-    await appendOrderRow({
-      order_id, status: 'pending',
-      customer_email: customer.email,
-      customer_phone: body.customer_phone || '',
-      customer_name: customer.name,
-      delivery_zone,
-      delivery_price,
-      items,
-      total_amount
-    });
-
-    const pref = await createPreference({
-      order_id, items,
-      payer: customer,
-      delivery_price
-    });
-
-    // Tilda корректно обработает 303 See Other -> init_point
-    return res.redirect(303, pref.init_point);
-  } catch (err) {
-    console.error('Checkout error:', err?.response?.data || err.message);
-    return res.status(500).send('Checkout ERROR');
-  }
-});
-
-// 2) MP -> webhook (фиксируем статус и уведомляем Tilda)
-app.post('/mp/webhook', async (req, res) => {
-  try {
-    // (Опционально) проверка подписи MP, если задан MP_WEBHOOK_SECRET
-    // Документация MP шлет заголовки x-signature/x-request-id; можно добавить валидацию здесь.
-
-    const { type, action, data } = req.body || {};
-    if (type === 'payment' && data?.id) {
-      const payment = await fetchPayment(data.id);
-      const status = payment.status;                  // approved / pending / rejected / cancelled …
-      const order_id = payment.external_reference;
-
-      // Журналируем
-      await updateRowByOrderId(order_id, { payment_id: payment.id, status });
-
-      // Если оплата подтверждена — сообщаем в Tilda
-      if (status === TILDA_SUCCESS_VALUE) {
-        const r = await notifyTilda({ payment_id: payment.id, status });
-        console.log('Notify Tilda:', r);
-      }
+    const { cart, buyer, currency = 'ARS', statement_descriptor = 'PHO IS IT' } = req.body || {};
+    if (!cart || !Array.isArray(cart) || cart.length === 0) {
+      return res.status(400).json({ ok: false, error: 'EMPTY_CART' });
     }
 
-    return res.status(200).send('OK');
+    const orderId = newOrderId();
+    const items = mapCartToMpItems(cart, currency);
+
+    const payload = {
+      items,
+      back_urls: {
+        success: TILDA_SUCCESS,
+        failure: TILDA_SUCCESS, // можно выделить отдельно страницы, если нужно
+        pending: TILDA_SUCCESS
+      },
+      auto_return: 'approved',
+      external_reference: orderId,
+      // пойдёт напрямую в платёж и вернётся на confirm
+      metadata: {
+        orderId,
+        buyer: buyer || {},
+        cart,
+        source: 'tilda-st100'
+      },
+      statement_descriptor
+      // notification_url: (не используем — без вебхуков)
+    };
+
+    const mp = await axios.post(
+      'https://api.mercadopago.com/checkout/preferences',
+      payload,
+      { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } }
+    );
+
+    const init_point = mp?.data?.init_point;
+    if (!init_point) {
+      return res.status(502).json({ ok: false, error: 'MP_NO_INIT_POINT', mp: mp?.data });
+    }
+
+    return res.json({ ok: true, orderId, init_point });
   } catch (err) {
-    console.error('Webhook error:', err?.response?.data || err.message);
-    return res.status(200).send('OK'); // отвечаем 200, чтобы MP не ретраил бесконечно
+    console.error('create-preference error:', err?.response?.data || err.message);
+    return res.status(500).json({
+      ok: false,
+      error: 'SERVER_ERROR',
+      details: err?.response?.data || err.message
+    });
   }
 });
 
-// 3) Простой healthcheck
-app.get('/health', (_, res) => res.send('ok'));
+// 2) Подтверждение оплаты и запись в Google Sheets
+app.get('/api/mp/confirm', async (req, res) => {
+  try {
+    const paymentId = req.query.payment_id || req.query.paymentId || req.query.id;
+    if (!paymentId) return res.status(400).json({ ok: false, error: 'MISSING_payment_id' });
 
+    // Получаем платёж из MP
+    const mp = await axios.get(
+      `https://api.mercadopago.com/v1/payments/${encodeURIComponent(paymentId)}`,
+      { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } }
+    );
+
+    const p = mp?.data;
+    if (!p || !p.id) {
+      return res.status(404).json({ ok: false, error: 'PAYMENT_NOT_FOUND' });
+    }
+
+    // Проверка статуса
+    const status = p.status;                 // 'approved', 'rejected', etc.
+    const status_detail = p.status_detail;   // детализация
+    const approved = status === 'approved';
+
+    // Берём metadata, external_reference, сумму и т.д.
+    const metadata = p.metadata || {};
+    const external_reference = p.external_reference || metadata.orderId || null;
+    const amount = p.transaction_amount || 0;
+    const currency = p.currency_id || 'ARS';
+    const dateApproved = p.date_approved || null;
+
+    // Если платёж не approved — просто сообщим состояние
+    if (!approved) {
+      return res.json({
+        ok: true,
+        approved: false,
+        status,
+        status_detail,
+        payment_id: p.id,
+        orderId: external_reference,
+        amount,
+        currency
+      });
+    }
+
+    // Защита от дублей: если уже логировали этот payment_id — не добавляем ещё раз
+    const already = await wasPaymentLogged(p.id);
+    if (!already) {
+      const buyer = (metadata && metadata.buyer) || {};
+      const cart = (metadata && metadata.cart) || [];
+
+      const deliveryMode = buyer.deliveryMode || buyer.delivery || '';
+      const address = buyer.address || '';
+      const note = buyer.note || buyer.comment || '';
+
+      const nowIso = new Date().toISOString();
+
+      const row = [
+        nowIso,
+        external_reference || '',
+        String(p.id),
+        status,
+        amount,
+        currency,
+        buyer.name || '',
+        buyer.phone || '',
+        buyer.email || '',
+        deliveryMode || '',
+        address || '',
+        note || '',
+        JSON.stringify(cart),
+        JSON.stringify(metadata)
+      ];
+
+      await appendOrderRow(row);
+    }
+
+    // Ответ для фронтенда «Спасибо»
+    return res.json({
+      ok: true,
+      approved: true,
+      payment_id: p.id,
+      status,
+      status_detail,
+      orderId: external_reference,
+      amount,
+      currency,
+      dateApproved,
+      buyer: (metadata && metadata.buyer) || {},
+      cart: (metadata && metadata.cart) || []
+    });
+
+  } catch (err) {
+    console.error('confirm error:', err?.response?.data || err.message);
+    return res.status(500).json({
+      ok: false,
+      error: 'SERVER_ERROR',
+      details: err?.response?.data || err.message
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Start
+// ─────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`pho-backend listening on :${PORT}`);
+  console.log(`Base URL: ${PUBLIC_BASE_URL}`);
+});
