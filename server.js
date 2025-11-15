@@ -1,146 +1,217 @@
 // server.js
-'use strict';
-
 const express = require('express');
-const cors = require('cors');
 const axios = require('axios');
+const morgan = require('morgan');
+const { google } = require('googleapis');
+
+// Google Sheets: запись заказа
+async function appendToSheet(order) {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
+      scopes: ['https://www.googleapis.com/auth/spreadsheets']
+    });
+
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const spreadsheetId = '1A0Q3x9kS8T7lgzT_BulWaM1cT1DeGzZn0F7zAGc-coU'; 
+    const sheetName = 'Pho';
+
+    const timestamp = new Date().toISOString();
+
+    const row = [
+      timestamp,
+      order.order_id,
+      order.payment_id,
+      order.status,
+      order.customer_email,
+      order.customer_phone,
+      order.customer_name,
+      order.delivery_zone,
+      order.delivery_price,
+      JSON.stringify(order.items),
+      order.total_amount
+    ];
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: `${sheetName}!A1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [row] }
+    });
+
+    console.log('Google Sheets: запись добавлена.');
+  } catch (err) {
+    console.error('Google Sheets error:', err.message);
+  }
+}
 
 const app = express();
 
-// --- Конфиг из переменных окружения ---
-const PORT = process.env.PORT || 10000;
-const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN; // PROD токен
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://pho-backend.onrender.com';
-
-// Куда вернуть пользователя после оплаты (ваша страница "Gracias" в Тильде)
-const DEFAULT_SUCCESS_URL = process.env.MP_SUCCESS_URL || 'http://phorestaurante.tilda.ws/page93974626.html';
-
-// --- Базовая защита и парсинг ---
-app.use(cors()); // для простоты открываемся всем; при желании ограничьте на домен Tilda
+// логирование и парсинг
+app.use(morgan('combined'));
 app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-// Раздача статических файлов из /public (в т.ч. tilda-mp.js)
-app.use(express.static('public', { maxAge: '5m' }));
+// healthcheck
+app.get('/health', (req, res) => res.status(200).send('OK'));
 
-app.get('/health', (_req, res) => res.status(200).send('ok'));
-
-// --- Stub вебхука (пока что просто 200 OK, пригодится позже) ---
-app.post('/mp/webhook', (req, res) => {
-  // На следующем этапе будем обрабатывать уведомления.
-  res.sendStatus(200);
-});
-
-// --- Вспомогательные функции ---
-function toAmount(n) {
-  const num = Number(String(n).replace(',', '.'));
-  if (!isFinite(num)) return 0;
-  return Math.round(num * 100) / 100; // 2 знака
-}
-
-function normalizeItems(items, currency) {
-  const cur = (currency || 'ARS').toUpperCase();
-  if (Array.isArray(items) && items.length) {
-    return items.map((p, idx) => ({
-      id: String(p.id ?? idx + 1),
-      title: String(p.title ?? p.name ?? 'Producto'),
-      quantity: Number(p.quantity ?? p.qty ?? 1),
-      currency_id: cur,
-      unit_price: toAmount(p.unit_price ?? p.price ?? 0),
-    }));
-  }
-  return null;
-}
-
-// --- Главный эндпоинт: создать Preference и вернуть init_point ---
-app.post('/mp/create-preference', async (req, res) => {
+// === 1) Точка оплаты для Тильды ===
+// Tilda: Settings → Платежные системы → Универсальная → API URL = https://<твой-домен>/api/tilda/checkout
+app.post('/api/tilda/checkout', async (req, res) => {
   try {
-    if (!MP_ACCESS_TOKEN) {
-      return res.status(500).json({ error: 'MP_ACCESS_TOKEN is not set on the server' });
+    const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
+    if (!MP_TOKEN) {
+      console.error('MP_ACCESS_TOKEN не задан');
+      return res.status(500).send('Mercado Pago token is missing');
     }
 
+    // Достаём данные из формы Тильды
     const {
-      total,
-      currency = 'ARS',
-      items,
-      payer = {},
-      delivery_zone,
-      success_url,        // опционально переопределить success
-      external_reference, // опционально
-    } = req.body || {};
+      orderid,
+      order_id,
+      description,
+      amount,            // если настроишь "Сумма заказа" = amount, придёт тут
+      email,
+      customer_email,
+      delivery_price,
+      shipping_price,
+      products           // Массив товаров: JSON или base64(JSON)
+    } = req.body;
 
-    const amount = toAmount(total);
-    if (amount <= 0 && !(items && items.length)) {
-      return res.status(400).json({ error: 'Invalid total or items' });
-    }
+    // Внешняя ссылка на заказ (для поиска в логах/вебхуках)
+    const externalRef = String(order_id || orderid || Date.now());
 
-    const mpItems = normalizeItems(items, currency) || [{
-      id: 'ORDER-1',
-      title: 'Pedido PHO',
-      quantity: 1,
-      currency_id: (currency || 'ARS').toUpperCase(),
-      unit_price: amount,
-    }];
-
-    const preference = {
-      items: mpItems,
-      binary_mode: true, // без статуса "pending"
-      auto_return: 'approved',
-      back_urls: {
-        success: success_url || DEFAULT_SUCCESS_URL,
-        failure: success_url || DEFAULT_SUCCESS_URL,
-        pending: success_url || DEFAULT_SUCCESS_URL,
-      },
-      notification_url: `${PUBLIC_BASE_URL.replace(/\/+$/, '')}/mp/webhook`,
-      statement_descriptor: 'PHO IS IT',
-      external_reference: external_reference || `tilda-${Date.now()}`,
-      metadata: {
-        delivery_zone: delivery_zone || null,
-      },
-      payer: {
-        name: payer.name || null,
-        surname: payer.surname || null,
-        email: payer.email || null,
-        phone: payer.phone ? {
-          area_code: payer.phone.area_code || '',
-          number: String(payer.phone.number || '').replace(/\D/g, '')
-        } : undefined,
-        identification: payer.identification,
-      },
+    // Разбор товаров
+    const parseProducts = (val) => {
+      if (!val) return [];
+      if (Array.isArray(val)) return val;
+      if (typeof val === 'string') {
+        try { return JSON.parse(val); } catch (_) {}
+        try { return JSON.parse(Buffer.from(val, 'base64').toString('utf8')); } catch (_) {}
+      }
+      return [];
     };
 
-    const response = await axios.post(
-      'https://api.mercadopago.com/checkout/preferences',
-      preference,
-      {
-        headers: {
-          Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 10000,
-      }
-    );
+    const itemsIn = parseProducts(products);
 
-    const pref = response.data || {};
-    const link = pref.init_point || pref.sandbox_init_point;
-    if (!link) {
-      return res.status(502).json({ error: 'Mercado Pago did not return init_point' });
+    // Собираем позиции для MP (валюта ARS)
+    let items = itemsIn.map((p, i) => ({
+      title: p.name || `Item ${i + 1}`,
+      quantity: Number(p.quantity) || 1,
+      currency_id: 'ARS',
+      unit_price: Number(p.price) || 0
+    }));
+
+    // Доставка отдельной позицией (если пришла)
+    const ship = Number(delivery_price || shipping_price);
+    if (!Number.isNaN(ship) && ship > 0) {
+      items.push({
+        title: 'Delivery',
+        quantity: 1,
+        currency_id: 'ARS',
+        unit_price: ship
+      });
     }
 
-    return res.json({
-      id: pref.id,
-      init_point: link,
-    });
+    // Если товаров нет — берём общую сумму
+    if (items.length === 0) {
+      const total = Number(amount);
+      if (Number.isNaN(total) || total <= 0) {
+        return res.status(400).send('Bad order: no items and no amount');
+      }
+      items = [{
+        title: description || `Order ${externalRef}`,
+        quantity: 1,
+        currency_id: 'ARS',
+        unit_price: total
+      }];
+    }
+
+    const baseUrl = process.env.PUBLIC_BASE_URL || '';
+    const successUrl = process.env.SUCCESS_URL || 'https://phorestaurante.tilda.ws/thank-you';
+    const failureUrl = process.env.FAIL_URL || successUrl;
+    const pendingUrl = process.env.PENDING_URL || successUrl;
+
+    // Создаём preference (Checkout Pro)
+    const prefBody = {
+      items,
+      payer: {
+        email: customer_email || email || undefined
+      },
+      back_urls: {
+        success: successUrl,
+        failure: failureUrl,
+        pending: pendingUrl
+      },
+      auto_return: 'approved',
+      external_reference: externalRef,
+      // Вебхук в наш сервер
+      notification_url: baseUrl ? `${baseUrl}/mp/webhook` : undefined,
+      statement_descriptor: 'PHO RESTO'
+    };
+
+    const mpResp = await axios.post(
+      'https://api.mercadopago.com/checkout/preferences',
+      prefBody,
+      { headers: { Authorization: `Bearer ${MP_TOKEN}` } }
+    );
+
+    const initPoint = mpResp?.data?.init_point;
+    if (!initPoint) {
+      console.error('init_point отсутствует', mpResp?.data);
+      return res.status(502).send('Mercado Pago: init_point missing');
+    }
+
+    // Редиректим клиента на Mercado Pago
+    return res.redirect(302, initPoint);
   } catch (err) {
-    console.error('MP create-preference error:', err?.response?.data || err.message);
-    return res.status(500).json({
-      error: 'Failed to create Mercado Pago preference',
-      details: err?.response?.data || err.message,
-    });
+    console.error('checkout error:', err?.response?.data || err.message);
+    return res.status(500).send('Checkout error');
   }
 });
 
-// --- Старт сервера ---
-app.listen(PORT, () => {
-  console.log(`pho-backend listening on ${PORT}`);
+// === 2) Вебхуки Mercado Pago ===
+// MP панель: Webhooks → URL de producción = https://<твой-домен>/mp/webhook
+// Симулятор иногда дергает GET — держим и GET, и POST.
+app.get('/mp/webhook', (req, res) => {
+  // простой ответ для проверки URL
+  return res.status(200).send('OK');
 });
+
+app.post('/mp/webhook', async (req, res) => {
+  try {
+    const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
+    const event = req.body || {};
+    console.log('MP webhook event:', JSON.stringify(event));
+
+    // Типичный payload: { type: "payment", data: { id: "123456" } }
+    if (event.type === 'payment' && event.data && event.data.id) {
+      const id = event.data.id;
+      try {
+        const payResp = await axios.get(
+          `https://api.mercadopago.com/v1/payments/${id}`,
+          { headers: { Authorization: `Bearer ${MP_TOKEN}` } }
+        );
+        const st = payResp?.data?.status;
+        const extRef = payResp?.data?.external_reference;
+        console.log(`payment ${id} status=`, st, 'external_reference=', extRef);
+
+        // Здесь можно: отправить в Google Sheets/WhatsApp/Тильду
+        // TODO: ваш код пост-обработки успешной оплаты (st === 'approved')
+      } catch (e) {
+        console.error('fetch payment error:', e?.response?.data || e.message);
+      }
+    }
+
+    // Важно: всегда 200, иначе MP будет ретраить
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error('webhook error:', err.message);
+    return res.sendStatus(200); // всё равно 200
+  }
+});
+
+// старт
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('listening on', PORT));
