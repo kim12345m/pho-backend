@@ -1,346 +1,222 @@
-'use strict';
-
+// server.js
 const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-const morgan = require('morgan');
 const { google } = require('googleapis');
 
-// -------------------- ENV --------------------
-const {
-  PORT = 10000,
-  MP_ACCESS_TOKEN,                // из Mercado Pago (Access Token)
-  PUBLIC_BASE_URL,                // https://pho-backend.onrender.com
-  TILDA_NOTIFICATION_URL,         // https://forms.tildacdn.com/payment/notify/?projectid=17652556  (или твой custom-URL из скрина)
-  TILDA_SUCCESS_FIELD = 'status', // 'status'
-  TILDA_SUCCESS_VALUE = 'approved', // 'approved'
-  GOOGLE_SERVICE_ACCOUNT_JSON,    // весь JSON сервис-аккаунта в 1 переменной
-  GOOGLE_SHEET_ID,                // ID таблицы (из URL Google Sheets)
-  GOOGLE_SHEET_TAB_NAME = 'Pho'   // имя листа ('Pho')
-} = process.env;
-
-// -------------------- BASIC APP --------------------
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-app.use(morgan('tiny'));
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// простая проверка здоровья
-app.get('/health', (_req, res) => res.status(200).send('OK'));
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || '';
+const SHEETS_SPREADSHEET_ID = process.env.SHEETS_SPREADSHEET_ID;
+const SHEETS_TAB_NAME = process.env.SHEETS_TAB_NAME || 'Sheet1';
 
-// -------------------- HELPERS --------------------
-/** Универсальный парсер чисел с точками/запятыми/разделителями тысяч */
-function parseMoney(value) {
-  if (typeof value === 'number') return value;
-  if (!value) return 0;
-  const s = String(value).trim();
-  // убираем пробелы, символы валюты, нецифры кроме . и ,
-  const cleaned = s.replace(/[^\d.,-]/g, '');
-  // если есть и точки и запятой – считаем, что точка это разделитель тысяч
-  const normalized = cleaned.indexOf('.') > -1 && cleaned.indexOf(',') > -1
-    ? cleaned.replace(/\./g, '').replace(',', '.')
-    : cleaned.replace(',', '.');
-  const n = Number(normalized);
-  return Number.isFinite(n) ? n : 0;
-}
+// --- Helpers: Google Sheets ---
+async function getSheetsClient() {
+  const json = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (!json || !SHEETS_SPREADSHEET_ID) {
+    throw new Error('Sheets env vars missing');
+  }
+  const key = JSON.parse(json);
+  if (!key.client_email || !key.private_key) {
+    throw new Error('Bad service account key');
+  }
+  // Ключ часто приходит с \\n — заменяем на реальные переводы строк
+  key.private_key = key.private_key.replace(/\\n/g, '\n');
 
-/** Безопасный JSON.parse */
-function safeJsonParse(maybeJson) {
-  if (maybeJson == null) return null;
-  if (Array.isArray(maybeJson) || typeof maybeJson === 'object') return maybeJson;
-  try { return JSON.parse(String(maybeJson)); } catch { return null; }
-}
-
-/** Достаём ID платёжа из разных форматов webhook Mercado Pago */
-function extractPaymentId(req) {
-  if (req.query && req.query.id) return req.query.id;
-  const body = req.body || {};
-  if (body.data && body.data.id) return body.data.id;
-  if (body.id) return body.id;
-  return null;
-}
-
-/** Собираем строку для записи в Google Sheets */
-function toRowForSheet({
-  timestamp,
-  order_id,
-  payment_id,
-  status,
-  customer_email,
-  customer_phone,
-  customer_name,
-  delivery_zone,
-  delivery_price,
-  items_json,
-  total_amount
-}) {
-  return [
-    timestamp,
-    order_id || '',
-    payment_id || '',
-    status || '',
-    customer_email || '',
-    customer_phone || '',
-    customer_name || '',
-    delivery_zone || '',
-    delivery_price != null ? String(delivery_price) : '',
-    items_json || '',
-    total_amount != null ? String(total_amount) : ''
-  ];
-}
-
-// -------------------- GOOGLE SHEETS --------------------
-let sheetsClient = null;
-
-function getSheetsClient() {
-  if (sheetsClient) return sheetsClient;
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON is not set');
-  if (!GOOGLE_SHEET_ID) throw new Error('GOOGLE_SHEET_ID is not set');
-
-  const creds = JSON.parse(GOOGLE_SERVICE_ACCOUNT_JSON);
-  const jwt = new google.auth.JWT(
-    creds.client_email,
+  const auth = new google.auth.JWT(
+    key.client_email,
     null,
-    creds.private_key,
+    key.private_key,
     ['https://www.googleapis.com/auth/spreadsheets']
   );
-  sheetsClient = google.sheets({ version: 'v4', auth: jwt });
-  return sheetsClient;
+  await auth.authorize();
+  return google.sheets({ version: 'v4', auth });
 }
 
-async function appendToSheet(rowArray) {
-  const sheets = getSheetsClient();
-  const range = `${GOOGLE_SHEET_TAB_NAME}!A:Z`;
+async function appendRowToSheet(row) {
+  const sheets = await getSheetsClient();
+  const range = `${SHEETS_TAB_NAME}!A:Z`;
   await sheets.spreadsheets.values.append({
-    spreadsheetId: GOOGLE_SHEET_ID,
+    spreadsheetId: SHEETS_SPREADSHEET_ID,
     range,
-    valueInputOption: 'RAW',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [rowArray] }
+    valueInputOption: 'USER_ENTERED',
+    requestBody: { values: [row] }
   });
 }
 
-// -------------------- TILDA NOTIFY --------------------
-/**
- * Отправляем уведомление в Tilda, чтобы заказ считался оплаченным.
- * Важные поля: orderid, payment_id, status(=approved) и signature (тот же, что пришёл от Tilda).
- * Мы передадим минимум — Tilda этого достаточно.
- */
-async function notifyTilda({ orderid, payment_id, signature, amount, currency }) {
-  if (!TILDA_NOTIFICATION_URL) return;
-  const payload = new URLSearchParams();
-  if (orderid) payload.append('orderid', orderid);
-  if (payment_id) payload.append('payment_id', String(payment_id));
-  if (TILDA_SUCCESS_FIELD && TILDA_SUCCESS_VALUE) {
-    payload.append(TILDA_SUCCESS_FIELD, TILDA_SUCCESS_VALUE);
-  }
-  if (signature) payload.append('signature', signature);
-  if (amount != null) payload.append('amount', String(amount));
-  if (currency) payload.append('currency', currency);
+// --- Helpers: нормализация корзины из Tilda ---
+function normalizeCart(body) {
+  // Tilda/формы часто передают разные имена полей. Поддержим распространённые.
+  let orderId =
+    body.orderId || body.order_id || body.tildaorderid || body.order || '';
+  let total = parseFloat(
+    body.total || body.amount || body.sum || body.price || body.orderprice || 0
+  );
+  if (Number.isNaN(total)) total = 0;
 
+  // Список товаров может прийти массивом, либо JSON-строкой
+  let items = [];
+  const possible = body.items || body.products || body.cart || body.cart_json;
+  if (possible) {
+    try {
+      const parsed = Array.isArray(possible) ? possible : JSON.parse(possible);
+      items = parsed.map((it) => ({
+        title: it.title || it.name || 'Item',
+        unit_price: Number(it.price || it.unit_price || 0),
+        quantity: Number(it.quantity || 1),
+        currency_id: it.currency_id || 'ARS'
+      }));
+      if (!total) {
+        total = items.reduce((s, it) => s + it.unit_price * it.quantity, 0);
+      }
+    } catch (_) {
+      // если не распарсилось — не страшно, ниже сделаем единый товар на всю сумму
+    }
+  }
+
+  const customer = {
+    email: body.email || body.client_email || body.customer_email || body.Mail || undefined,
+    name: body.name || body.client_name || body.customer_name || undefined,
+    phone: body.phone || body.client_phone || body.customer_phone || undefined
+  };
+
+  // округлим до копеек/сентиavos
+  total = Math.round(total * 100) / 100;
+  return { total, items, orderId, customer };
+}
+
+// --- Health ---
+app.get('/', (_req, res) => res.send('OK'));
+
+// --- Создание чекаута Mercado Pago и редирект ---
+app.post('/mp/create-checkout', async (req, res) => {
   try {
-    await axios.post(TILDA_NOTIFICATION_URL, payload.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 10000
+    if (!MP_ACCESS_TOKEN) {
+      return res.status(500).send('MP_ACCESS_TOKEN is not set');
+    }
+    const { total, items, orderId, customer } = normalizeCart(req.body);
+    if (!total || total <= 0) {
+      return res.status(400).send('Bad total');
+    }
+
+    const preference = {
+      items: items.length
+        ? items
+        : [
+            {
+              title: `Order ${orderId || ''}`,
+              unit_price: total,
+              quantity: 1,
+              currency_id: 'ARS'
+            }
+          ],
+      back_urls: {
+        success: `${PUBLIC_BASE_URL}/mp/return?status=success`,
+        failure: `${PUBLIC_BASE_URL}/mp/return?status=failure`,
+        pending: `${PUBLIC_BASE_URL}/mp/return?status=pending`
+      },
+      auto_return: 'approved',
+      notification_url: `${PUBLIC_BASE_URL}/mp/webhook`,
+      external_reference: orderId || undefined,
+      payer: customer?.email ? { email: customer.email } : undefined,
+      metadata: {
+        orderId: orderId || '',
+        items
+      }
+    };
+
+    const resp = await fetch('https://api.mercadopago.com/checkout/preferences', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${MP_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(preference)
     });
+
+    const data = await resp.json();
+    if (!resp.ok) {
+      console.error('MP preference error', data);
+      return res.status(502).send('Mercado Pago error');
+    }
+
+    const url = data.init_point || data.sandbox_init_point;
+    // Возвращаем 302 редирект — браузер сразу уйдёт на Mercado Pago
+    return res.redirect(302, url);
   } catch (e) {
-    // логируем, но не валим обработку
-    console.error('Tilda notify error:', e.response?.status, e.response?.data || e.message);
+    console.error('create-checkout error', e);
+    return res.status(500).send('Internal error');
+  }
+});
+
+// --- Webhook от Mercado Pago ---
+app.post('/mp/webhook', async (req, res) => {
+  // Отвечаем сразу, чтобы MP не ретрайл.
+  res.status(200).send('OK');
+  try {
+    const { type, action, data } = req.body || {};
+    const isPayment =
+      type === 'payment' || (typeof action === 'string' && action.startsWith('payment'));
+    if (isPayment && data?.id) {
+      await handlePayment(String(data.id));
+    }
+  } catch (e) {
+    console.error('webhook error', e);
+  }
+});
+
+async function handlePayment(paymentId) {
+  try {
+    const resp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+      headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` }
+    });
+    const payment = await resp.json();
+    if (!resp.ok) {
+      console.error('MP payment fetch error:', payment);
+      return;
+    }
+    if (payment.status === 'approved') {
+      const md = payment.metadata || {};
+      const items = md.items || payment.additional_info?.items || [];
+      const total = payment.transaction_amount;
+      const email =
+        payment.payer?.email || payment.additional_info?.payer?.email || '';
+
+      const row = [
+        new Date().toISOString(),                 // дата/время
+        String(payment.id),                       // id платежа
+        md.orderId || payment.external_reference || '', // orderId
+        email,                                    // email покупателя
+        total,                                    // сумма
+        payment.currency_id || 'ARS',             // валюта
+        JSON.stringify(items)                     // состав заказа
+      ];
+
+      try {
+        await appendRowToSheet(row);
+      } catch (err) {
+        console.error('Sheets append error', err);
+      }
+    }
+  } catch (e) {
+    console.error('handlePayment error', e);
   }
 }
 
-// -------------------- CHECKOUT FROM TILDA --------------------
-/**
- * Tilda шлёт сюда POST при нажатии Checkout.
- * Мы:
- * 1) читаем заказ (products, amount и т.д.)
- * 2) создаём preference в Mercado Pago
- * 3) отдаём Tilda ссылку на оплату (init_point)
- *
- * В ответ возвращаем JSON { url: ... } — Tilda это понимает.
- */
-app.post('/api/tilda/checkout', async (req, res) => {
-  try {
-    if (!MP_ACCESS_TOKEN) throw new Error('MP_ACCESS_TOKEN is not set');
-    if (!PUBLIC_BASE_URL) throw new Error('PUBLIC_BASE_URL is not set');
-
-    const b = req.body || {};
-    // стандартные поля из настроек Tilda
-    const orderid = b.orderid || b.order_id || '';
-    const description = b.description || 'Pedido';
-    const currency = (b.currency || 'ARS').toUpperCase();
-    const amount = parseMoney(b.amount);
-    const email = b.email || b.customer_email || '';
-    const phone = b.phone || b.customer_phone || '';
-    const name = b.name || b.customer_name || '';
-    const signature = b.signature || ''; // важно: вернём его в notify
-    // возможные пользовательские поля (если ты их добавишь в Tilda)
-    const delivery_zone = b.delivery_zone || '';
-    const delivery_price = parseMoney(b.delivery_price);
-
-    // товары
-    const productsRaw = safeJsonParse(b.products);
-    const items = Array.isArray(productsRaw) && productsRaw.length > 0
-      ? productsRaw.map(p => ({
-          title: p.name || 'Item',
-          quantity: Number(p.quantity || 1),
-          currency_id: currency,
-          unit_price: parseMoney(p.price)
-        }))
-      : [{
-          title: description,
-          quantity: 1,
-          currency_id: currency,
-          unit_price: amount
-        }];
-
-    // включим доставку как отдельную позицию, если Tilda её не добавила, но ты передал delivery_price
-    if (delivery_zone && delivery_price > 0) {
-      items.push({
-        title: `Delivery – ${delivery_zone}`,
-        quantity: 1,
-        currency_id: currency,
-        unit_price: delivery_price
-      });
-    }
-
-    // Строка external_reference: кладём туда orderid и signature,
-    // чтобы на webhook точно вернуть их в Tilda
-    const external_reference = [orderid, signature].join('|');
-
-    // создаём Checkout Preference
-    const pref = {
-      items,
-      payer: {
-        email,
-        name
-      },
-      back_urls: {
-        success: `${PUBLIC_BASE_URL}/mp/return`,
-        pending: `${PUBLIC_BASE_URL}/mp/return`,
-        failure: `${PUBLIC_BASE_URL}/mp/return`
-      },
-      auto_return: 'approved',
-      binary_mode: true,
-      notification_url: `${PUBLIC_BASE_URL}/mp/webhook`,
-      external_reference
-      // (по желанию можно добавить statement_descriptor)
-    };
-
-    const mp = await axios.post(
-      'https://api.mercadopago.com/checkout/preferences',
-      pref,
-      { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } }
-    );
-
-    // Возвращаем Tilda ссылку на оплату
-    const payUrl = mp.data && (mp.data.init_point || mp.data.sandbox_init_point);
-    if (!payUrl) throw new Error('Mercado Pago did not return init_point');
-
-    res.status(200).json({ url: payUrl });
-  } catch (err) {
-    console.error('Checkout error:', err.message);
-    res.status(500).json({ error: 'checkout_failed', message: err.message });
-  }
-});
-
-// -------------------- MP RETURN (для человека) --------------------
+// --- Возврат со страницы MP (просто инфо-страница) ---
 app.get('/mp/return', (req, res) => {
-  // простая «заглушка» страницы возврата
-  res
-    .status(200)
-    .send('<html><body><h3>Gracias. Si el pago fue aprobado, lo registraremos enseguida.</h3></body></html>');
+  const { status } = req.query;
+  const message =
+    status === 'success'
+      ? 'Pago aprobado. ¡Gracias!'
+      : status === 'pending'
+      ? 'Pago pendiente.'
+      : 'Pago cancelado o rechazado.';
+  res.send(
+    `<html><meta charset="utf-8"><body><h2>${message}</h2><p><a href="/">Volver</a></p></body></html>`
+  );
 });
 
-// -------------------- MP WEBHOOK --------------------
-/**
- * Mercado Pago шлёт сюда уведомления.
- * Мы:
- * 1) вытягиваем payment_id и запрашиваем детали оплаты
- * 2) если статус approved — шлём notify в Tilda и пишем строку в Google Sheets
- */
-app.post('/mp/webhook', async (req, res) => {
-  const paymentId = extractPaymentId(req);
-  if (!paymentId) {
-    // МР иногда шлёт нотификации «без id»; отвечаем 200, чтобы не спамило ретраями
-    return res.status(200).send('noop');
-  }
-
-  try {
-    const { data: payment } = await axios.get(
-      `https://api.mercadopago.com/v1/payments/${paymentId}`,
-      { headers: { Authorization: `Bearer ${MP_ACCESS_TOKEN}` } }
-    );
-
-    const status = payment.status; // expected 'approved'
-    const transaction_amount = payment.transaction_amount;
-    const currency = payment.currency_id || 'ARS';
-    const extRef = payment.external_reference || '';
-    const [orderid, signature] = extRef.split('|');
-
-    const payer = payment.payer || {};
-    const customer_email = payer.email || '';
-    const customer_name = [payer.first_name || '', payer.last_name || ''].join(' ').trim();
-    const customer_phone = payer.phone && payer.phone.number ? String(payer.phone.number) : '';
-
-    // Позиции заказа (доступны в additional_info.items)
-    const addInfo = payment.additional_info || {};
-    const addItems = Array.isArray(addInfo.items) ? addInfo.items : [];
-    const items_json = JSON.stringify(addItems);
-
-    // Попробуем вычислить доставку из позиций
-    let delivery_zone = '';
-    let delivery_price = 0;
-    for (const it of addItems) {
-      const t = (it.title || '').toLowerCase();
-      if (t.includes('delivery') || t.includes('envío') || t.includes('envio')) {
-        delivery_zone = it.title;
-        delivery_price = parseMoney(it.unit_price);
-        break;
-      }
-    }
-
-    // Уведомим Tilda (статус + payment_id + тот же signature)
-    if (status && status.toLowerCase() === TILDA_SUCCESS_VALUE.toLowerCase()) {
-      await notifyTilda({
-        orderid,
-        payment_id: paymentId,
-        signature,
-        amount: transaction_amount,
-        currency
-      });
-    }
-
-    // Запишем строку в Google Sheets
-    try {
-      const row = toRowForSheet({
-        timestamp: new Date().toISOString(),
-        order_id: orderid,
-        payment_id: String(paymentId),
-        status,
-        customer_email,
-        customer_phone,
-        customer_name,
-        delivery_zone,
-        delivery_price,
-        items_json,
-        total_amount: transaction_amount
-      });
-      await appendToSheet(row);
-    } catch (sheetErr) {
-      console.error('Sheets append error:', sheetErr.message);
-    }
-
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('Webhook error:', err.response?.status, err.response?.data || err.message);
-    // всё равно 200 — чтобы Mercado Pago не слал ретраи бесконечно
-    res.status(200).send('OK');
-  }
-});
-
-// -------------------- START --------------------
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on :${PORT}`));
