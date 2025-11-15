@@ -2,6 +2,49 @@
 const express = require('express');
 const axios = require('axios');
 const morgan = require('morgan');
+const { google } = require('googleapis');
+
+// Google Sheets: запись заказа
+async function appendToSheet(order) {
+  try {
+    const auth = new google.auth.GoogleAuth({
+      credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
+      scopes: ['https://www.googleapis.com/auth/spreadsheets']
+    });
+
+    const sheets = google.sheets({ version: 'v4', auth });
+
+    const spreadsheetId = '1A0Q3x9kS8T7lgzT_BulWaM1cT1DeGzZn0F7zAGc-coU'; 
+    const sheetName = 'Pho';
+
+    const timestamp = new Date().toISOString();
+
+    const row = [
+      timestamp,
+      order.order_id,
+      order.payment_id,
+      order.status,
+      order.customer_email,
+      order.customer_phone,
+      order.customer_name,
+      order.delivery_zone,
+      order.delivery_price,
+      JSON.stringify(order.items),
+      order.total_amount
+    ];
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId,
+      range: `${sheetName}!A1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [row] }
+    });
+
+    console.log('Google Sheets: запись добавлена.');
+  } catch (err) {
+    console.error('Google Sheets error:', err.message);
+  }
+}
 
 const app = express();
 
