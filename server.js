@@ -4,7 +4,9 @@ const axios = require('axios');
 const morgan = require('morgan');
 const { google } = require('googleapis');
 
+// -----------------------------
 // Google Sheets: запись заказа
+// -----------------------------
 async function appendToSheet(order) {
   try {
     const auth = new google.auth.GoogleAuth({
@@ -14,7 +16,8 @@ async function appendToSheet(order) {
 
     const sheets = google.sheets({ version: 'v4', auth });
 
-    const spreadsheetId = '1A0Q3x9kS8T7lgzT_BulWaM1cT1DeGzZn0F7zAGc-coU'; 
+    // Твой Google Sheet ID и вкладка
+    const spreadsheetId = '1A0Q3x9kS8T7lgzT_BulWaM1cT1DeGzZn0F7zAGc-coU';
     const sheetName = 'Pho';
 
     const timestamp = new Date().toISOString();
@@ -56,8 +59,10 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 // healthcheck
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-// === 1) Точка оплаты для Тильды ===
-// Tilda: Settings → Платежные системы → Универсальная → API URL = https://<твой-домен>/api/tilda/checkout
+
+// ---------------------------------------------------
+// 1) Точка оплаты от Тильды → создаёт MercadoPago ссылка
+// ---------------------------------------------------
 app.post('/api/tilda/checkout', async (req, res) => {
   try {
     const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
@@ -66,23 +71,16 @@ app.post('/api/tilda/checkout', async (req, res) => {
       return res.status(500).send('Mercado Pago token is missing');
     }
 
-    // Достаём данные из формы Тильды
     const {
-      orderid,
-      order_id,
-      description,
-      amount,            // если настроишь "Сумма заказа" = amount, придёт тут
-      email,
-      customer_email,
-      delivery_price,
-      shipping_price,
-      products           // Массив товаров: JSON или base64(JSON)
+      orderid, order_id, description,
+      amount, email, customer_email,
+      delivery_price, shipping_price,
+      products
     } = req.body;
 
-    // Внешняя ссылка на заказ (для поиска в логах/вебхуках)
     const externalRef = String(order_id || orderid || Date.now());
 
-    // Разбор товаров
+    // Разбор списка товаров
     const parseProducts = (val) => {
       if (!val) return [];
       if (Array.isArray(val)) return val;
@@ -95,7 +93,6 @@ app.post('/api/tilda/checkout', async (req, res) => {
 
     const itemsIn = parseProducts(products);
 
-    // Собираем позиции для MP (валюта ARS)
     let items = itemsIn.map((p, i) => ({
       title: p.name || `Item ${i + 1}`,
       quantity: Number(p.quantity) || 1,
@@ -103,7 +100,7 @@ app.post('/api/tilda/checkout', async (req, res) => {
       unit_price: Number(p.price) || 0
     }));
 
-    // Доставка отдельной позицией (если пришла)
+    // Доставка как отдельная позиция
     const ship = Number(delivery_price || shipping_price);
     if (!Number.isNaN(ship) && ship > 0) {
       items.push({
@@ -114,7 +111,7 @@ app.post('/api/tilda/checkout', async (req, res) => {
       });
     }
 
-    // Если товаров нет — берём общую сумму
+    // Если товаров нет — fallback
     if (items.length === 0) {
       const total = Number(amount);
       if (Number.isNaN(total) || total <= 0) {
@@ -128,12 +125,13 @@ app.post('/api/tilda/checkout', async (req, res) => {
       }];
     }
 
+    // URL'ы
     const baseUrl = process.env.PUBLIC_BASE_URL || '';
     const successUrl = process.env.SUCCESS_URL || 'https://phorestaurante.tilda.ws/thank-you';
     const failureUrl = process.env.FAIL_URL || successUrl;
     const pendingUrl = process.env.PENDING_URL || successUrl;
 
-    // Создаём preference (Checkout Pro)
+    // Preference body
     const prefBody = {
       items,
       payer: {
@@ -146,7 +144,6 @@ app.post('/api/tilda/checkout', async (req, res) => {
       },
       auto_return: 'approved',
       external_reference: externalRef,
-      // Вебхук в наш сервер
       notification_url: baseUrl ? `${baseUrl}/mp/webhook` : undefined,
       statement_descriptor: 'PHO RESTO'
     };
@@ -163,55 +160,18 @@ app.post('/api/tilda/checkout', async (req, res) => {
       return res.status(502).send('Mercado Pago: init_point missing');
     }
 
-    // Редиректим клиента на Mercado Pago
     return res.redirect(302, initPoint);
+
   } catch (err) {
     console.error('checkout error:', err?.response?.data || err.message);
     return res.status(500).send('Checkout error');
   }
 });
 
-// === 2) Вебхуки Mercado Pago ===
-// MP панель: Webhooks → URL de producción = https://<твой-домен>/mp/webhook
-// Симулятор иногда дергает GET — держим и GET, и POST.
-app.get('/mp/webhook', (req, res) => {
-  // простой ответ для проверки URL
-  return res.status(200).send('OK');
-});
 
-app.post('/mp/webhook', async (req, res) => {
-  try {
-    const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
-    const event = req.body || {};
-    console.log('MP webhook event:', JSON.stringify(event));
+// ---------------------------------------------------
+// 2) Вебхуки Mercado Pago → подтверждение оплаты → Sheets
+// ---------------------------------------------------
+app.get('/mp/webhook', (req, res) => res.status(200).send('OK'));
 
-    // Типичный payload: { type: "payment", data: { id: "123456" } }
-    if (event.type === 'payment' && event.data && event.data.id) {
-      const id = event.data.id;
-      try {
-        const payResp = await axios.get(
-          `https://api.mercadopago.com/v1/payments/${id}`,
-          { headers: { Authorization: `Bearer ${MP_TOKEN}` } }
-        );
-        const st = payResp?.data?.status;
-        const extRef = payResp?.data?.external_reference;
-        console.log(`payment ${id} status=`, st, 'external_reference=', extRef);
-
-        // Здесь можно: отправить в Google Sheets/WhatsApp/Тильду
-        // TODO: ваш код пост-обработки успешной оплаты (st === 'approved')
-      } catch (e) {
-        console.error('fetch payment error:', e?.response?.data || e.message);
-      }
-    }
-
-    // Важно: всегда 200, иначе MP будет ретраить
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error('webhook error:', err.message);
-    return res.sendStatus(200); // всё равно 200
-  }
-});
-
-// старт
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('listening on', PORT));
+app.post('/mp/w
