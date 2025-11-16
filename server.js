@@ -141,40 +141,6 @@ async function sendWhatsAppText(to, text) {
   }
 }
 
-// === WhatsApp: шаблон PEDIDO_PAGADO для ресторана ===
-async function sendWhatsAppPedidoPagado(to, orderId, amount, currency) {
-  const phoneId = process.env.WA_PHONE_ID;
-  const token = process.env.WA_TOKEN;
-
-  if (!phoneId || !token) {
-    console.warn('WA_PHONE_ID или WA_TOKEN не заданы — WhatsApp-уведомление пропущено');
-    return;
-  }
-  if (!to) {
-    console.warn('WA_RESTAURANT (номер получателя) не задан — WhatsApp-уведомление пропущено');
-    return;
-  }
-
-  const url = `https://graph.facebook.com/v20.0/${phoneId}/messages`;
-
-  const body = {
-    messaging_product: 'whatsapp',
-    to,
-    type: 'template',
-    template: {
-      name: 'pedido_pagado',       // имя шаблона как в менеджере
-      language: { code: 'es_AR' }, // Spanish (ARG)
-      components: [
-        {
-          type: 'body',
-          parameters: [
-            { type: 'text', text: String(orderId || '') },               // {{1}}
-            { type: 'text', text: String(amount) + ' ' + (currency || 'ARS') } // {{2}}
-          ]
-        }
-      ]
-    }
-  };
 
   try {
     const resp = await axios.post(url, body, {
