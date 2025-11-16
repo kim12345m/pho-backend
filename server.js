@@ -7,6 +7,52 @@ const morgan = require('morgan');
 const crypto = require('crypto');
 const { google } = require('googleapis');
 
+// === [НОВОЕ] Опциональный Redis для идемпотентности ===
+let redisClient = null;
+let redisReady = false;
+try {
+  if (process.env.REDIS_URL) {
+    // пакет "redis" v4: npm i redis
+    const { createClient } = require('redis');
+    redisClient = createClient({ url: process.env.REDIS_URL });
+    redisClient.on('error', (e) => console.error('Redis error:', e.message));
+    redisClient.connect()
+      .then(() => { redisReady = true; console.log('Redis connected'); })
+      .catch((e) => console.error('Redis connect error:', e.message));
+  }
+} catch (_) {
+  console.warn('Пакет "redis" не установлен — будет использоваться in-memory кеш');
+}
+
+// === [НОВОЕ] In-memory fallback (для одного процесса) ===
+const localOnce = new Map(); // key -> expireAt
+function localSetOnce(key, ttlSec) {
+  const now = Date.now();
+  const exp = localOnce.get(key);
+  if (exp && exp > now) return false; // уже было
+  const until = now + ttlSec * 1000;
+  localOnce.set(key, until);
+  setTimeout(() => {
+    if (localOnce.get(key) === until) localOnce.delete(key);
+  }, ttlSec * 1000 + 1000);
+  return true;
+}
+async function claimOnce(key, ttlSec = 3 * 24 * 3600) {
+  if (redisReady) {
+    // NX + EX — установим флаг "отправлено" ровно один раз
+    const r = await redisClient.set(key, '1', { NX: true, EX: ttlSec });
+    return r === 'OK';
+  }
+  return localSetOnce(key, ttlSec);
+}
+async function releaseOnce(key) {
+  if (redisReady) {
+    try { await redisClient.del(key); } catch (_) {}
+  } else {
+    localOnce.delete(key);
+  }
+}
+
 // ---------- Google Sheets (опционально: логировать оплату) ----------
 async function appendToSheet(order) {
   try {
@@ -62,8 +108,7 @@ function parseProducts(val) {
   return [];
 }
 
-// Подпись для Tilda: MD5 от конкатенации значений всех полей (кроме signature) в алфавитном порядке ключей.
-// Если включишь HMAC в интерфейсе Tilda — раскомментируй ветку с HMAC и включи переменную TILDA_USE_HMAC=1.
+// Подпись для Tilda
 function tildaSignature(payload) {
   const keys = Object.keys(payload)
     .filter(k => k !== 'signature')
@@ -79,7 +124,7 @@ function tildaSignature(payload) {
 }
 
 async function notifyTilda(payload) {
-  const url = process.env.TILDA_NOTIFICATION_URL; // вида https://forms.tildaapi.com/payment/custom/psXXXX
+  const url = process.env.TILDA_NOTIFICATION_URL;
   if (!url) {
     console.warn('TILDA_NOTIFICATION_URL не задан — уведомление в Tilda пропущено');
     return;
@@ -138,24 +183,9 @@ async function sendWhatsAppText(to, text) {
     console.log('WhatsApp notify:', resp.status, resp.data);
   } catch (err) {
     console.error('WhatsApp notify error:', err?.response?.data || err.message);
+    throw err;
   }
 }
-
-
-  try {
-    const resp = await axios.post(url, body, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
-    });
-    console.log('WhatsApp template notify:', resp.status, resp.data);
-  } catch (err) {
-    console.error('WhatsApp template notify error:', err?.response?.data || err.message);
-  }
-}
-
 
 // ---------- app ----------
 const app = express();
@@ -166,7 +196,6 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.get('/health', (_, res) => res.status(200).send('OK'));
 
 // === 1) Старт оплаты с Tilda ===
-// Tilda → POST /api/tilda/checkout
 app.post('/api/tilda/checkout', async (req, res) => {
   try {
     const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
@@ -236,7 +265,6 @@ app.post('/api/tilda/checkout', async (req, res) => {
       external_reference: externalRef,
       notification_url: baseUrl ? `${baseUrl}/mp/webhook` : undefined,
       statement_descriptor: 'PHO RESTO'
-      // при необходимости можно включить binary_mode: true
     };
 
     const mpResp = await axios.post(
@@ -256,54 +284,68 @@ app.post('/api/tilda/checkout', async (req, res) => {
 });
 
 // === 2) Вебхуки Mercado Pago ===
-// В кабинете MP: Webhooks → URL = https://<PUBLIC_BASE_URL>/mp/webhook
 app.get('/mp/webhook', (_, res) => res.status(200).send('OK'));
 
-app.post('/mp/webhook', async (req, res) => {
-  try {
-    const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
-    const event = req.body || {};
-    console.log('MP webhook:', JSON.stringify(event));
+// [НОВОЕ] — быстрый ACK + обработка в фоне, идемпотентность для WhatsApp и Sheets
+app.post('/mp/webhook', (req, res) => {
+  // 1) Сразу отвечаем 200, чтобы MP не ретраил
+  res.sendStatus(200);
 
-    const isPaymentEvent =
-      event?.type === 'payment' ||
-      req.query?.type === 'payment' ||
-      req.query?.topic === 'payment';
+  // 2) Дальше — асинхронная обработка
+  (async () => {
+    try {
+      const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
+      const event = req.body || {};
+      const query = req.query || {};
+      console.log('MP webhook:', JSON.stringify({ body: event, query }));
 
-    const paymentId = event?.data?.id || req.query?.id;
+      const isPaymentEvent =
+        event?.type === 'payment' ||
+        query?.type === 'payment' ||
+        query?.topic === 'payment';
 
-    if (isPaymentEvent && paymentId) {
+      const paymentId = event?.data?.id || query?.id;
+      if (!isPaymentEvent || !paymentId) return;
+
+      // Получаем платеж
+      let p;
       try {
-        const { data: p } = await axios.get(
+        const { data } = await axios.get(
           `https://api.mercadopago.com/v1/payments/${paymentId}`,
-          { headers: { Authorization: `Bearer ${MP_TOKEN}` } }
+          { headers: { Authorization: `Bearer ${MP_TOKEN}` }, timeout: 10000 }
         );
+        p = data;
+      } catch (e) {
+        console.error('fetch payment error:', e?.response?.data || e.message);
+        return;
+      }
 
-        console.log(`Payment ${p.id}: status=${p.status} external_reference=${p.external_reference}`);
+      console.log(`Payment ${p.id}: status=${p.status} external_reference=${p.external_reference}`);
 
-        // уведомляем Tilda (она сама пометит заказ оплаченным при status === 'approved')
+      // Уведомляем Tilda всегда (пусть будет идемпотентно на стороне Tilda)
+      try {
         await notifyTilda({
-          orderid: String(p.external_reference || ''),     // должен совпадать с orderid, который Tilda отправляла на /checkout
+          orderid: String(p.external_reference || ''), // должен совпадать с orderid у /checkout
           payment_id: String(p.id),
           status: String(p.status || 'unknown'),
           amount: p.transaction_amount,
           currency: p.currency_id || 'ARS',
           email: p.payer?.email || ''
         });
+      } catch (_) {}
 
-        // опционально логируем в Google Sheets
-        await appendToSheet({
-          order_id: p.external_reference,
-          payment_id: p.id,
-          status: p.status,
-          customer_email: p.payer?.email || '',
-          items: [],
-          total_amount: p.transaction_amount
-        });
+      // Только при успешной оплате — и только один раз на заказ
+      if (p.status === 'approved') {
+        const to = process.env.WA_RESTAURANT;
+        const key = `wa:order-approved:${p.external_reference || p.id}`; // один ключ на заказ
 
-        // === WhatsApp: уведомление ресторану при успешной оплате ===
-        if (p.status === 'approved') {
-          const to = process.env.WA_RESTAURANT; // твой номер WhatsApp (для демо) или номер ресторана
+        const firstTime = await claimOnce(key, 7 * 24 * 3600); // неделя
+        if (!firstTime) {
+          console.log('Skip duplicate WhatsApp for', key);
+          return;
+        }
+
+        try {
           const msgLines = [
             `✅ Nuevo pedido #${p.external_reference || p.id}`,
             `Estado: PAGADO`,
@@ -312,19 +354,26 @@ app.post('/mp/webhook', async (req, res) => {
           ].filter(Boolean);
 
           await sendWhatsAppText(to, msgLines.join('\n'));
+
+          // [Опционально] лог в таблицу — тоже только один раз
+          await appendToSheet({
+            order_id: p.external_reference,
+            payment_id: p.id,
+            status: p.status,
+            customer_email: p.payer?.email || '',
+            items: [],
+            total_amount: p.transaction_amount
+          });
+        } catch (err) {
+          // если отправка упала — освободим флажок, чтобы можно было повторить позже
+          await releaseOnce(key);
+          console.error('WhatsApp/Sheet flow error:', err.message);
         }
-
-      } catch (e) {
-        console.error('fetch payment error:', e?.response?.data || e.message);
       }
+    } catch (err) {
+      console.error('webhook async error:', err.message);
     }
-
-    // всегда 200 — иначе MP будет ретраить
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('webhook error:', err.message);
-    res.sendStatus(200);
-  }
+  })();
 });
 
 // ---------- start ----------
